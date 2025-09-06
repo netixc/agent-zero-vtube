@@ -38,76 +38,40 @@ class VTubeSimple(Extension):
         super().__init__(agent)
         
     async def execute(self, loop_data=None, text="", parsed=None, **kwargs):
-        """Send complete responses to VTube"""
-        # Skip if no parsed data
-        if not parsed or not isinstance(parsed, dict):
+        """Process streaming response text in real-time"""
+        # Skip if not a response tool
+        if (
+            not parsed 
+            or not isinstance(parsed, dict)
+            or parsed.get("tool_name") != "response"
+            or "tool_args" not in parsed
+            or "text" not in parsed["tool_args"]
+            or not parsed["tool_args"]["text"]
+        ):
             return
-            
-        # Check if response tool
-        if parsed.get("tool_name") != "response":
-            return
-            
-        # Get text from tool args
-        tool_args = parsed.get("tool_args")
-        if not tool_args or not isinstance(tool_args, dict):
-            return
-            
-        response_text = tool_args.get("text", "").strip()
+        
+        # Get the current streaming response text
+        response_text = parsed["tool_args"]["text"].strip()
         if not response_text:
             return
-            
+        
         # Reset tracking if this is a completely new response
         if not VTubeSimple._pending_response or not response_text.startswith(VTubeSimple._pending_response):
             VTubeSimple._last_sent_length = 0
         
-        # Update pending response and timestamp
+        # Update pending response
         VTubeSimple._pending_response = response_text
-        VTubeSimple._last_update_time = time.time()
         
-        # Cancel any existing send task
-        if VTubeSimple._send_task and not VTubeSimple._send_task.done():
-            VTubeSimple._send_task.cancel()
-        
-        # Schedule a new send task after delay
-        VTubeSimple._send_task = asyncio.create_task(self._delayed_send())
+        # Process any new complete sentences immediately
+        await self._process_new_sentences(response_text)
     
-    async def _delayed_send(self):
-        """Send response chunks as they become available"""
+    async def _process_new_sentences(self, full_text):
+        """Process any new complete sentences in the streaming text"""
         try:
-            # Check for new content every 0.2 seconds
-            await asyncio.sleep(0.2)
-            
-            response_text = VTubeSimple._pending_response
-            if not response_text:
+            # Get only the new text since last processing
+            new_text = full_text[VTubeSimple._last_sent_length:]
+            if not new_text:
                 return
-            
-            # Check if we have new content since last send
-            if len(response_text) <= VTubeSimple._last_sent_length:
-                # No new content, wait a bit more and try final send
-                await asyncio.sleep(0.3)
-                response_text = VTubeSimple._pending_response
-                if len(response_text) <= VTubeSimple._last_sent_length:
-                    return  # Still no new content
-            
-            # Find complete sentences to send
-            await self._send_streaming_chunks(response_text)
-            
-        except asyncio.CancelledError:
-            # Task was cancelled, that's fine
-            pass
-        except Exception as e:
-            if str(e).strip():
-                self.agent.context.log.log(
-                    type="error",
-                    heading="VTube Error",
-                    content=str(e)[:100]
-                )
-    
-    async def _send_streaming_chunks(self, full_response):
-        """Send response in chunks as sentences become available"""
-        try:
-            # Get the new portion since last send
-            new_text = full_response[VTubeSimple._last_sent_length:]
             
             # Find complete sentences in the new text
             sentences = self._extract_complete_sentences(new_text)
@@ -117,51 +81,68 @@ class VTubeSimple(Extension):
                     # Get emotion for this sentence
                     emotion = self._get_emotion(sentence)
                     
-                    # Send this sentence immediately
-                    await self._send_single_emotion(emotion, sentence.strip())
+                    # Send immediately without delay
+                    asyncio.create_task(self._send_single_emotion_async(emotion, sentence.strip()))
                     
-                    # Update our tracking
+                    # Update tracking
                     VTubeSimple._last_sent_length += len(sentence)
-                    
-                    # Small delay between sentences so they don't overlap
-                    await asyncio.sleep(0.5)
             
-            # If there's remaining partial text and response seems complete, send it
-            remaining = full_response[VTubeSimple._last_sent_length:].strip()
-            if remaining and self._looks_complete(full_response):
-                emotion = self._get_emotion(remaining)
-                await self._send_single_emotion(emotion, remaining)
-                VTubeSimple._last_sent_length = len(full_response)
-                
         except Exception as e:
-            if str(e).strip():
-                self.agent.context.log.log(
-                    type="error",
-                    heading="VTube Streaming Error",
-                    content=f"Streaming error: {str(e)[:100]}"
-                )
+            # Don't interrupt streaming on errors
+            pass
+    
+    async def _send_single_emotion_async(self, emotion, text):
+        """Send a single emotion and text to VTube asynchronously"""
+        try:
+            # Generate audio in background
+            audio_data = await asyncio.get_event_loop().run_in_executor(
+                None, self._generate_audio, text
+            )
+            if not audio_data:
+                return
+                
+            # Simple volume pattern
+            duration_ms = len(audio_data) // 88
+            num_chunks = max(1, duration_ms // 20)
+            volumes = [0.7] * num_chunks
+            
+            # Send to VTube
+            payload = {
+                "type": "external_audio",
+                "audio": base64.b64encode(audio_data).decode('utf-8'),
+                "volumes": volumes,
+                "slice_length": 20,
+                "display_text": {
+                    "text": f"{emotion} {text}",
+                    "duration": len(volumes) * 0.02
+                },
+                "source": "agent_zero_streaming"
+            }
+            
+            response = requests.post(
+                f"{self.VTUBE_API_URL}/api/external_audio",
+                json=payload,
+                timeout=5
+            )
+            
+        except Exception as e:
+            # Don't interrupt streaming on errors
+            pass
     
     def _extract_complete_sentences(self, text):
         """Extract complete sentences from text"""
         import re
-        # Split on sentence endings but keep the punctuation
-        sentences = re.split(r'([.!?]+\s*)', text)
-        complete_sentences = []
+        sentences = []
+        current_pos = 0
         
-        i = 0
-        while i < len(sentences) - 1:
-            sentence = sentences[i]
-            if i + 1 < len(sentences):
-                punctuation = sentences[i + 1]
-                if punctuation.strip():
-                    complete_sentences.append(sentence + punctuation)
-                    i += 2
-                else:
-                    i += 1
-            else:
-                i += 1
-                
-        return complete_sentences
+        # Find sentence endings with punctuation
+        for match in re.finditer(r'[.!?]+\s*', text):
+            sentence = text[current_pos:match.end()].strip()
+            if sentence:
+                sentences.append(sentence)
+            current_pos = match.end()
+        
+        return sentences
     
     def _looks_complete(self, text):
         """Check if response looks complete (ends with punctuation)"""
@@ -188,13 +169,6 @@ class VTubeSimple(Extension):
         """Send a single emotion and text to VTube"""
         try:
             text_with_emotion = f"{emotion} {text}"
-            
-            # Log what we're doing
-            self.agent.context.log.log(
-                type="info",
-                heading="VTube",
-                content=f"Sending: {text_with_emotion[:60]}..."
-            )
             
             # Generate audio
             audio_data = await asyncio.get_event_loop().run_in_executor(
